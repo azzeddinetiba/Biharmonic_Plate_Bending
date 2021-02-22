@@ -365,8 +365,50 @@ namespace Biharmonic
 
     data_out.build_patches(degree + 1);
 
+
+    QGauss<dim>     quadrature_formula(degree + 2);
+
+    Vector<double> dvdx2(triangulation.n_active_cells());
+    Vector<double> dvdy2(triangulation.n_active_cells());
+
+    Vector<double> moments(triangulation.n_active_cells());
+    std::vector< std::vector< Tensor< 2, dim>>> moments_tensor(quadrature_formula.size(),
+    		std::vector<Tensor<2, dim>>(dim));
+
+
+    FEValues<dim>     fe_values(fe,
+                                quadrature_formula,
+                                update_values | update_hessians);
+
+
+      for (auto &cell : dof_handler.active_cell_iterators())
+          {
+
+				double vx = 0., vy = 0.;
+				fe_values.reinit(cell);
+				fe_values.get_function_hessians(solution, moments_tensor);
+
+				for (unsigned int q = 0; q < quadrature_formula.size(); ++q)
+					{
+						vx += moments_tensor[q][1][0][0];
+						vy += moments_tensor[q][1][1][1];
+					}
+
+				dvdx2(cell->active_cell_index()) =
+				  (vx / quadrature_formula.size());
+				dvdy2(cell->active_cell_index()) =
+				  (vy / quadrature_formula.size());
+          }
+
+
+    moments = dvdx2 + poisson * dvdy2;
+
+    data_out.add_data_vector(moments, "Bending_moment");
+    data_out.build_patches();
+
     std::ofstream output("solution.vtu");
     data_out.write_vtu(output);
+
   }
 
 
