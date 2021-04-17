@@ -19,6 +19,7 @@
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/function.h>
+#include <deal.II/numerics/fe_field_function.h>
 
 #include <deal.II/lac/block_vector.h>
 #include <deal.II/lac/full_matrix.h>
@@ -46,6 +47,12 @@
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_out.h>
 
+#include <deal.II/grid/grid_out.h>
+#include <deal.II/lac/affine_constraints.h>
+#include <deal.II/grid/grid_refinement.h>
+#include <deal.II/numerics/error_estimator.h>
+
+
 #include <fstream>
 #include <iostream>
 #include <math.h>
@@ -67,23 +74,30 @@ namespace Biharmonic
     void run();
 
   private:
-    void make_grid_and_dofs();
+    void make_dofs();
     void assemble_system();
     void solve();
     void output_results() const;
+    void compute_errors() const;
+    void refine_grid();
 
     const unsigned int degree;
     double rigidity, ext_Pressure, poisson;
 
     Triangulation<dim> triangulation;
     FESystem<dim>      fe;
-    DoFHandler<dim>    dof_handler;
+
+    AffineConstraints<double> constraints;
 
     BlockSparsityPattern      sparsity_pattern;
     BlockSparseMatrix<double> system_matrix;
 
     BlockVector<double> solution;
+    BlockVector<double> sch_solution;
     BlockVector<double> system_rhs;
+
+  public:
+    DoFHandler<dim>    dof_handler;
   };
 
 
@@ -113,6 +127,41 @@ namespace Biharmonic
     }
 
 
+    template <int dim>
+    class Sch_Solution : public Function<dim>
+    {
+    public:
+      Sch_Solution(BlockVector<double> sol)
+        : Function<dim>(2)
+      {sch_sol = sol;}
+
+      BlockVector<double> sch_sol;
+
+      virtual void vector_value(const Point<dim> &p,
+                                Vector<double> &  value) const override;
+    };
+
+    template <int dim>
+    void Sch_Solution<dim>::vector_value(const Point<dim> &p,
+                                          Vector<double> &  values) const
+    {
+
+          Triangulation<dim> triangulation;
+    	  DoFHandler<dim>    dof_handler(triangulation);
+          FESystem<dim>      fe(FE_Q<dim>(1), 1, FE_Q<dim>(1), 1);
+          GridGenerator::hyper_cube(triangulation, -1, 1);
+          triangulation.refine_global(4);
+          dof_handler.distribute_dofs(fe);
+          DoFRenumbering::component_wise(dof_handler);
+
+
+          Functions::FEFieldFunction<2, DoFHandler<dim>, BlockVector<double>> fld(dof_handler, sch_sol);
+        values(0) = fld.value(p, 0);
+        values(1) = fld.value(p, 1);
+
+
+    }
+
   } // namespace PrescribedSolution
 
 
@@ -132,24 +181,52 @@ namespace Biharmonic
 
 
   template <int dim>
-  void MixedLaplaceProblem<dim>::make_grid_and_dofs()
+  void MixedLaplaceProblem<dim>::refine_grid()
   {
-    GridGenerator::hyper_cube(triangulation, -1, 1);
+    Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+    KellyErrorEstimator<dim>::estimate(dof_handler,
+                                       QGauss<dim - 1>(fe.degree + 1),
+                                       {},
+                                       solution,
+                                       estimated_error_per_cell);
+    GridRefinement::refine_and_coarsen_fixed_number(triangulation,
+                                                    estimated_error_per_cell,
+                                                    0.3,
+                                                    0.03);
+    triangulation.execute_coarsening_and_refinement();
+  }
 
-    for (auto &face : triangulation.active_face_iterators())
-      {
-        if (std::fabs(face->center()(1) - (-1.0)) < 1e-12 ||
-            std::fabs(face->center()(1) - (1.0)) < 1e-12  ||
-        	std::fabs(face->center()(0) - (-1.0)) < 1e-12 ||
-			std::fabs(face->center()(0) - (1.0)) < 1e-12)
-        	face->set_boundary_id(0);
-      }
 
-    triangulation.refine_global(5);
+
+  template <int dim>
+  void MixedLaplaceProblem<dim>::make_dofs()
+  {
+//    GridGenerator::hyper_cube(triangulation, -1, 1);
+//
+//    for (auto &face : triangulation.active_face_iterators())
+//      {
+//        if (std::fabs(face->center()(1) - (-1.0)) < 1e-12 ||
+//            std::fabs(face->center()(1) - (1.0)) < 1e-12  ||
+//        	std::fabs(face->center()(0) - (-1.0)) < 1e-12 ||
+//			std::fabs(face->center()(0) - (1.0)) < 1e-12)
+//        	face->set_boundary_id(0);
+//      }
+//
+//    triangulation.refine_global(4);
 
     dof_handler.distribute_dofs(fe);
 
     DoFRenumbering::component_wise(dof_handler);
+
+
+    constraints.clear();
+    DoFTools::make_hanging_node_constraints(dof_handler, constraints);
+    VectorTools::interpolate_boundary_values(dof_handler,
+                                             0,
+                                             Functions::ZeroFunction<dim>(dim),
+                                             constraints);
+    constraints.close();
+
 
     const std::vector<types::global_dof_index> dofs_per_component =
       DoFTools::count_dofs_per_fe_component(dof_handler);
@@ -169,7 +246,7 @@ namespace Biharmonic
     dsp.block(0, 1).reinit(n_w, n_u);
     dsp.block(1, 1).reinit(n_u, n_u);
     dsp.collect_sizes();
-    DoFTools::make_sparsity_pattern(dof_handler, dsp);
+    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints, /*keep_constrained_dofs = */ false);
 
     sparsity_pattern.copy_from(dsp);
     system_matrix.reinit(sparsity_pattern);
@@ -242,8 +319,8 @@ namespace Biharmonic
 
 
                   local_matrix(i, j) +=
-                    ( rigidity * grad_phi_i_w * grad_phi_j_u
-                     - phi_j_w * phi_i_w//
+                    ( grad_phi_i_w * grad_phi_j_u
+                     - (1/rigidity) * phi_j_w * phi_i_w//
                       + grad_phi_i_u * grad_phi_j_w)                //
                     * fe_values.JxW(q);
                 }
@@ -254,26 +331,20 @@ namespace Biharmonic
 
         cell->get_dof_indices(local_dof_indices);
 
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          for (unsigned int j = 0; j < dofs_per_cell; ++j)
-            system_matrix.add(local_dof_indices[i],
-                              local_dof_indices[j],
-                              local_matrix(i, j));
-
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          system_rhs(local_dof_indices[i]) += local_rhs(i);
+        constraints.distribute_local_to_global(
+          local_matrix, local_rhs, local_dof_indices, system_matrix, system_rhs);
 
       }
 
-    std::map<types::global_dof_index, double> boundary_values;
-    VectorTools::interpolate_boundary_values(dof_handler,
-                                             0,
-											 Functions::ZeroFunction<dim>(dim),
-                                             boundary_values);
-    MatrixTools::apply_boundary_values(boundary_values,
-                                       system_matrix,
-                                       solution,
-                                       system_rhs);
+//    std::map<types::global_dof_index, double> boundary_values;
+//    VectorTools::interpolate_boundary_values(dof_handler,
+//                                             0,
+//											 Functions::ZeroFunction<dim>(dim),
+//                                             boundary_values);
+//    MatrixTools::apply_boundary_values(boundary_values,
+//                                       system_matrix,
+//                                       solution,
+//                                       system_rhs);
 
   }
 
@@ -282,9 +353,11 @@ namespace Biharmonic
   template <int dim>
   void MixedLaplaceProblem<dim>::solve()
   {
+//	    sch_solution = solution;
+
 
 //	           The UMFPACK Solver
-
+//
       deallog << "Solving linear system... ";
 
 	    SparseDirectUMFPACK A_direct;
@@ -293,6 +366,10 @@ namespace Biharmonic
 
 	    A_direct.vmult(solution, system_rhs);
 
+	    constraints.distribute(solution);
+
+//
+//
 //
 //    const auto &M = system_matrix.block(0, 0);
 //    const auto &B = system_matrix.block(0, 1);
@@ -301,8 +378,8 @@ namespace Biharmonic
 //
 //    const auto &F = system_rhs.block(1);
 //
-//    auto &W = solution.block(0);
-//    auto &U = solution.block(1);
+//    auto &W = sch_solution.block(0);
+//    auto &U = sch_solution.block(1);
 //
 //    const auto op_M = linear_operator(M);
 //    const auto op_B = linear_operator(B);
@@ -327,7 +404,7 @@ namespace Biharmonic
 //    const auto preconditioner_S =
 //      inverse_operator(op_aS, solver_aS, PreconditionIdentity());
 //
-//    const auto schur_rhs = F - 2 * F;
+//    const auto schur_rhs = -1 * F;
 //
 //    SolverControl            solver_control_S(2000, 1.e-12);
 //    SolverCG<Vector<double>> solver_S(solver_control_S);
@@ -342,7 +419,48 @@ namespace Biharmonic
 //
 //    W = op_M_inv * (op_B * U);
 //
-//    W = W - 2 * W;
+//    W = -1 * W;
+  }
+
+
+  template <int dim>
+  void MixedLaplaceProblem<dim>::compute_errors() const
+  {
+    const ComponentSelectFunction<dim> displacement_mask(1, dim);
+    const ComponentSelectFunction<dim> moment_mask(0, dim);
+
+    Vector<double> cellwise_errors(triangulation.n_active_cells());
+    QTrapez<1>     q_trapez;
+    QIterated<dim> quadrature(q_trapez, degree + 2);
+
+    PrescribedSolution::Sch_Solution<dim> sch_Sol(sch_solution);
+
+    VectorTools::integrate_difference(dof_handler,
+                                      solution,
+									  sch_Sol,
+                                      cellwise_errors,
+                                      quadrature,
+                                      VectorTools::L2_norm,
+                                      &displacement_mask);
+    const double u_l2_error =
+      VectorTools::compute_global_error(triangulation,
+                                        cellwise_errors,
+                                        VectorTools::L2_norm);
+
+
+    VectorTools::integrate_difference(dof_handler,
+                                      solution,
+									  sch_Sol,
+                                      cellwise_errors,
+                                      quadrature,
+                                      VectorTools::L2_norm,
+                                      &moment_mask);
+    const double w_l2_error =
+      VectorTools::compute_global_error(triangulation,
+                                        cellwise_errors,
+                                        VectorTools::L2_norm);
+    std::cout << "Errors: ||e_u||_L2 = " << u_l2_error
+              << ",   ||e_w||_L2 = " << w_l2_error << std::endl;
   }
 
 
@@ -416,10 +534,33 @@ namespace Biharmonic
   template <int dim>
   void MixedLaplaceProblem<dim>::run()
   {
-    make_grid_and_dofs();
-    assemble_system();
-    solve();
+
+
+	  for (unsigned int cycle = 0; cycle < 8; ++cycle)
+	    {
+	      std::cout << "Cycle " << cycle << ':' << std::endl;
+	      if (cycle == 0)
+	        {
+
+	    	  GridGenerator::hyper_cube(triangulation, -1, 1);
+	          triangulation.refine_global(1);
+	        }
+	      else
+
+	        refine_grid();
+
+	      std::cout << "   Number of active cells:       "
+	                << triangulation.n_active_cells() << std::endl;
+	      make_dofs();
+	      std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs()
+	                << std::endl;
+	      assemble_system();
+	      solve();
+//	      output_results(cycle);
+	    }
+
     output_results();
+    //compute_errors();
   }
 } // namespace Biharmonic
 
